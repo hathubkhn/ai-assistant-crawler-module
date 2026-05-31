@@ -2,7 +2,11 @@ from django.db import models
 from django.conf import settings
 from django.utils import timezone
 import uuid
-# Create your models here.
+# NOTE: This service writes into the SHARED database `research_paper_dev`,
+# whose tables are owned/created by another app (public_api). All models here
+# are therefore `managed = False` so Django never tries to migrate/ALTER them.
+# Field definitions are mapped to the REAL columns of the existing tables.
+
 
 class Paper(models.Model):
     FILE_FORMAT_CHOICES = [
@@ -12,26 +16,39 @@ class Paper(models.Model):
         ('txt', 'TXT'),
         ('html', 'HTML'),
     ]
-    uuid = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
-    title = models.CharField(max_length=200)
+    # Real PK is a UUID column named `id` (no separate `uuid` column exists).
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField(max_length=512)
     abstract = models.TextField()
     doi = models.CharField(max_length=200, null=True, blank=True)
     publication_date = models.DateField(null=True, blank=True)
-    journal_or_conference = models.CharField(max_length=200)
     file_format = models.CharField(max_length=20, choices=FILE_FORMAT_CHOICES, default='pdf')
     pdf_file = models.FileField(upload_to=settings.PAPER_PDF_DIR, null=True, blank=True)
-    keywords = models.CharField(max_length=200)
-    url = models.URLField(max_length=200)
-    pdf_url = models.URLField(max_length=200)
-    github_url = models.URLField(max_length=200, null=True, blank=True)
-    crawled_at = models.DateTimeField(default=timezone.now)
-    updated_at = models.DateTimeField(auto_now=True)
+    # `keywords` is a jsonb NOT NULL column -> store a JSON list, default [].
+    keywords = models.JSONField(default=list)
+    url = models.URLField(max_length=500)
+    pdf_url = models.URLField(max_length=500)
+    github_url = models.URLField(max_length=500, null=True, blank=True)
+    # NOT NULL text columns present in the real table; default '' so inserts succeed.
+    method = models.TextField(default='')
+    results = models.TextField(default='')
+    conclusions = models.TextField(default='')
+    bibtex = models.TextField(default='')
     download_count = models.IntegerField(default=0)
     views_count = models.IntegerField(default=0)
     citations_count = models.IntegerField(default=0)
+    crawled_at = models.DateTimeField(default=timezone.now)
+    embedded_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    # conference_id / journal_id (uuid, nullable) exist in the table but are not
+    # populated by the ArXiv crawl; omitted here so they default to NULL.
     references = models.ManyToManyField('self', symmetrical=False, related_name='referenced_papers')
+
     class Meta:
+        managed = False
         db_table = 'papers'
+
 
 class Author(models.Model):
     name = models.CharField(max_length=200)
@@ -39,61 +56,55 @@ class Author(models.Model):
     affiliation = models.CharField(max_length=200)
     bio = models.TextField()
     google_scholar_url = models.URLField(max_length=200)
+    # Real M2M table `authors_papers` has columns (author_id, paper_id) which
+    # match Django's auto-generated through naming, so no explicit through needed.
     papers = models.ManyToManyField(Paper, related_name='authors')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    
+
     class Meta:
+        managed = False
         db_table = 'authors'
 
+
+class Category(models.Model):
+    """Maps to the existing `tasks` table (PapersWithCode "tasks" == categories)."""
+    name = models.CharField(max_length=200)
+    description = models.TextField(default='')
+    # M2M via `tasks_papers`; explicit through needed because the FK column is
+    # `task_id` (not the default `category_id`).
+    papers = models.ManyToManyField(Paper, through='TaskPaper', related_name='categories')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        managed = False
+        db_table = 'tasks'
+
+
+class TaskPaper(models.Model):
+    """Through model for Category(tasks) <-> Paper via the real `tasks_papers` table."""
+    task = models.ForeignKey(Category, db_column='task_id', on_delete=models.CASCADE)
+    paper = models.ForeignKey(Paper, db_column='paper_id', on_delete=models.CASCADE)
+
+    class Meta:
+        managed = False
+        db_table = 'tasks_papers'
+
+
 class Dataset(models.Model):
-    """Represents a dataset used or mentioned in research papers."""
-    name = models.CharField(
-        max_length=300, 
-        unique=True, # Assume dataset names should be unique 
-        help_text="Name of the dataset (e.g., ImageNet, COCO, SQuAD)"
-    )
-    description = models.TextField(
-        blank=True, 
-        help_text="A brief description of the dataset."
-    )
-    crawled_url = models.URLField(
-        max_length=500, 
-        blank=True, 
-        null=True
-    )
-    url = models.URLField(
-        max_length=500, 
-        blank=True, 
-        null=True, 
-        help_text="Homepage or download URL for the dataset."
-    )
-    modalities = models.CharField(
-        max_length=300,
-        blank=True,
-        help_text="Data modalities (e.g., Image, Text, Audio, Video). Comma-separated if multiple."
-    )
-    languages = models.CharField(
-        max_length=300,
-        blank=True,
-        help_text="Languages present in the dataset (e.g., English, Chinese). Comma-separated."
-    )
-    licenses = models.CharField(
-        max_length=500, # Licenses can have long names or URLs
-        blank=True,
-        help_text="License(s) under which the dataset is available (e.g., CC BY-SA 4.0, MIT). Comma-separated."
-    )
-    tasks = models.CharField(
-        max_length=500, 
-        blank=True,
-        help_text="Common tasks the dataset is used for (e.g., Image Classification, Question Answering). Comma-separated."
-    )
-    papers = models.ManyToManyField(
-        Paper, 
-        related_name='datasets', 
-        blank=True,
-        help_text="Papers that use or reference this dataset."
-    )
+    """Kept as an unmanaged stub so existing imports (tasks.py) keep working.
+    The real datasets live in `public_api_dataset` with a different schema;
+    the ArXiv crawl does not touch datasets."""
+    name = models.CharField(max_length=300, unique=True)
+    description = models.TextField(blank=True)
+    crawled_url = models.URLField(max_length=500, blank=True, null=True)
+    url = models.URLField(max_length=500, blank=True, null=True)
+    modalities = models.CharField(max_length=300, blank=True)
+    languages = models.CharField(max_length=300, blank=True)
+    licenses = models.CharField(max_length=500, blank=True)
+    tasks = models.CharField(max_length=500, blank=True)
+    papers = models.ManyToManyField(Paper, related_name='datasets', blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -101,33 +112,27 @@ class Dataset(models.Model):
         return self.name
 
     class Meta:
+        managed = False
         db_table = 'datasets'
-        verbose_name = "Dataset"
-        verbose_name_plural = "Datasets"
 
-class Category(models.Model):
-    name = models.CharField(max_length=200, unique=True)
-    description = models.TextField(blank=True)
-    dataset = models.ManyToManyField(Dataset, related_name='categories')
-    papers = models.ManyToManyField(Paper, related_name='categories')
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    
-    class Meta:
-        db_table = 'categories'
 
 class CrawlTask(models.Model):
+    """Kept as an unmanaged stub so existing imports (tasks.py) keep working.
+    There is NO `crawl_tasks` table in the shared DB, so this must NOT be queried.
+    The ArXiv crawl deduplicates on `Paper.url` instead."""
     STATUS_CHOICES = [
         ('pending', 'Pending'),
         ('crawling', 'Crawling'),
         ('completed', 'Completed'),
         ('failed', 'Failed'),
     ]
-    url = models.URLField(max_length=200, unique=True)
+    url = models.URLField(max_length=500, unique=True)
     status = models.CharField(max_length=200, choices=STATUS_CHOICES)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     paper = models.OneToOneField(Paper, on_delete=models.CASCADE, related_name='crawl_task', null=True)
     dataset = models.OneToOneField(Dataset, on_delete=models.CASCADE, related_name='crawl_task', null=True)
+
     class Meta:
+        managed = False
         db_table = 'crawl_tasks'

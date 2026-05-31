@@ -170,3 +170,13 @@ openai
 
 - [ ] Có cần lưu `arxiv_id` riêng vào DB để dedup dễ hơn không?
 - [ ] PWC flow có cần bổ sung keyword extraction bằng LLM không (hiện chỉ ArXiv flow mới có)?
+
+Cách chạy:
+  # Crawl 10 bài (mặc định), có LLM
+  python manage.py crawl_arxiv
+
+  # Crawl 5 bài, bỏ qua LLM (nhanh hơn)
+  python manage.py crawl_arxiv --max-papers 5 --no-llm
+
+  # Crawl 50 bài với LLM
+  python manage.py crawl_arxiv --max-papers 50

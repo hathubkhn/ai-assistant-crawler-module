@@ -1,6 +1,7 @@
 
 import logging
 import re
+import time
 from bs4 import BeautifulSoup
 import requests
 from typing import List
@@ -484,6 +485,54 @@ def extract_dataset_tasks(soup: BeautifulSoup) -> list[str]:
     except Exception as e:
         logger.warning(f"Error extracting dataset tasks: {e}")
         return []
+
+def extract_keywords_with_llm(abstract: str) -> str:
+    """Extract keywords from abstract using an OpenAI-compatible LLM endpoint
+    (defaults to the internal vLLM server — see settings.OPENAI_BASE_URL).
+
+    Returns comma-separated keywords string, or '' on failure/skip.
+    """
+    from django.conf import settings
+    from openai import OpenAI
+
+    if not abstract or len(abstract) < 50:
+        return ''
+
+    model = getattr(settings, 'OPENAI_MODEL', '')
+    if not model:
+        logger.warning("OPENAI_MODEL not set. Skipping LLM keyword extraction.")
+        return ''
+
+    base_url = getattr(settings, 'OPENAI_BASE_URL', None)
+    # vLLM does not enforce the API key, but the OpenAI SDK refuses an empty string.
+    api_key = getattr(settings, 'OPENAI_API_KEY', '') or 'EMPTY'
+    truncated = abstract[:1000]
+
+    prompt = (
+        "Given the following research paper abstract, extract 8-10 keywords "
+        "that best represent the core topics, methods, and contributions. "
+        "Return as a comma-separated list of short phrases (1-3 words each). "
+        "Normalize to standard academic terms where possible.\n\n"
+        f"Abstract: {truncated}"
+    )
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+                temperature=0.3,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning(f"LLM keyword extraction attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+
+    return ''
+
 
 def parse_dataset_page(html_content: str, url: str) -> dict:
     """Parse a dataset page and extract all relevant information.

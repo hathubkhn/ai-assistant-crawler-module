@@ -11,7 +11,9 @@ import time
 import re
 
 from .models import CrawlTask, Paper, Author, Category, Dataset
-from .parsers import fetch_sitemap_content, parse_paper_page_html, parse_dataset_page
+from .parsers import fetch_sitemap_content, parse_paper_page_html, parse_dataset_page, extract_keywords_with_llm
+from .services.embed_client import embed_paper
+from .services.venue_client import map_paper_venue
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -305,7 +307,7 @@ def crawl_paper_details(self, task_id: int):
                 'publication_date': parsed_data.get('publication_date'),
                 'journal_or_conference': parsed_data.get('journal_or_conference', ''),
                 'file_format': parsed_data.get('file_format', 'pdf'),
-                'keywords': ','.join(parsed_data.get('keywords', [])),
+                'keywords': list(parsed_data.get('keywords', []) or []),
                 'url': task.url,
                 'pdf_url': parsed_data.get('pdf_url'),
                 'github_url': parsed_data.get('github_url'),
@@ -356,8 +358,13 @@ def crawl_paper_details(self, task_id: int):
             logger.exception(f"PDF download failed for Paper ID {new_paper.id} after main task success.")
     elif new_paper:
         logger.info(f"No PDF URL found in parsed data for Paper ID {new_paper.id}. Skipping download.")
-    
-    logger.info(f"Paper crawl task finished for Task ID: {task_id}") 
+
+    # 5. Auto venue mapping via backend API, then Qdrant embed (best-effort).
+    if new_paper:
+        map_paper_venue(new_paper.id)
+        embed_paper(new_paper)
+
+    logger.info(f"Paper crawl task finished for Task ID: {task_id}")
 
 
 # --- Dataset Crawling Task --- #
@@ -448,7 +455,257 @@ def crawl_dataset(self, dataset_name: str, dataset_url: str | None = None, paper
             logger.info(f"Created dataset with name only: {dataset_name}")
             
         return dataset.id
-        
+
     except Exception as e:
         logger.exception(f"Error processing dataset {dataset_name}: {e}")
-        raise self.retry(exc=e) 
+        raise self.retry(exc=e)
+
+
+# --- ArXiv Integration --- #
+
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
+ARXIV_BATCH_SIZE = 100
+ARXIV_BATCH_DELAY = 3  # seconds between requests
+
+
+def fetch_arxiv_page(start: int, max_results: int = ARXIV_BATCH_SIZE) -> str | None:
+    """Fetch one page of ArXiv results for all cs.* categories."""
+    params = {
+        'search_query': 'cat:cs.*',
+        'sortBy': 'submittedDate',
+        'sortOrder': 'descending',
+        'max_results': max_results,
+        'start': start,
+    }
+    try:
+        response = requests.get(ARXIV_API_URL, params=params, timeout=60)
+        response.raise_for_status()
+        return response.text
+    except requests.RequestException as e:
+        logger.error(f"Error fetching ArXiv page (start={start}): {e}")
+        return None
+
+
+def parse_arxiv_atom(xml_content: str) -> list[dict]:
+    """Parse ArXiv Atom XML feed and return list of paper dicts."""
+    from datetime import datetime, timezone as dt_timezone
+
+    ATOM = 'http://www.w3.org/2005/Atom'
+    ARXIV_NS = 'http://arxiv.org/schemas/atom'
+    papers = []
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        logger.error(f"Error parsing ArXiv Atom XML: {e}")
+        return papers
+
+    for entry in root.findall(f'{{{ATOM}}}entry'):
+        paper: dict = {}
+
+        id_el = entry.find(f'{{{ATOM}}}id')
+        if id_el is None or not id_el.text:
+            continue
+        paper['url'] = id_el.text.strip()
+
+        arxiv_match = re.search(r'abs/(.+)$', paper['url'])
+        arxiv_id = arxiv_match.group(1) if arxiv_match else None
+        paper['arxiv_id'] = arxiv_id
+        paper['pdf_url'] = f"https://arxiv.org/pdf/{arxiv_id}" if arxiv_id else ''
+
+        # Publisher DOI (arxiv:doi); usually absent for brand-new preprints.
+        doi_el = entry.find(f'{{{ARXIV_NS}}}doi')
+        paper['doi'] = doi_el.text.strip() if (doi_el is not None and doi_el.text) else None
+
+        title_el = entry.find(f'{{{ATOM}}}title')
+        paper['title'] = title_el.text.strip() if (title_el is not None and title_el.text) else '[Title Not Found]'
+
+        summary_el = entry.find(f'{{{ATOM}}}summary')
+        paper['abstract'] = summary_el.text.strip() if (summary_el is not None and summary_el.text) else ''
+
+        published_el = entry.find(f'{{{ATOM}}}published')
+        paper['publication_date'] = None
+        paper['published_dt'] = None
+        if published_el is not None and published_el.text:
+            try:
+                dt = datetime.fromisoformat(published_el.text.replace('Z', '+00:00'))
+                paper['published_dt'] = dt
+                paper['publication_date'] = dt.date().isoformat()
+            except ValueError:
+                pass
+
+        paper['authors'] = []
+        for author_el in entry.findall(f'{{{ATOM}}}author'):
+            name_el = author_el.find(f'{{{ATOM}}}name')
+            if name_el is not None and name_el.text:
+                paper['authors'].append(name_el.text.strip())
+
+        paper['categories'] = []
+        for cat_el in entry.findall(f'{{{ATOM}}}category'):
+            term = cat_el.get('term', '')
+            if term:
+                paper['categories'].append(term)
+
+        # Prefer the link with title="pdf" over the fallback constructed above
+        for link_el in entry.findall(f'{{{ATOM}}}link'):
+            if link_el.get('title') == 'pdf' or link_el.get('type') == 'application/pdf':
+                paper['pdf_url'] = link_el.get('href', paper['pdf_url'])
+                break
+
+        papers.append(paper)
+
+    return papers
+
+
+def _bare_arxiv_id(arxiv_id: str | None) -> str | None:
+    """Strip the version suffix (e.g. '2605.23904v1' -> '2605.23904')."""
+    if not arxiv_id:
+        return None
+    return re.sub(r'v\d+$', '', arxiv_id)
+
+
+def arxiv_doi(arxiv_id: str | None) -> str:
+    """Every arXiv submission has a DataCite DOI: 10.48550/arXiv.<bare_id>."""
+    bare = _bare_arxiv_id(arxiv_id)
+    return f'10.48550/arXiv.{bare}' if bare else ''
+
+
+def build_arxiv_bibtex(paper: dict) -> str:
+    """Generate a standard arXiv @misc BibTeX entry from parsed metadata.
+
+    New preprints are not yet on Crossref, so we build the arXiv-style entry
+    locally (matching what arxiv.org's own export produces)."""
+    bare = _bare_arxiv_id(paper.get('arxiv_id'))
+    if not bare:
+        return ''
+
+    authors = paper.get('authors') or []
+    author_str = ' and '.join(authors)
+
+    pub_dt = paper.get('published_dt')
+    year = pub_dt.year if pub_dt else ''
+
+    # Cite key: <firstauthorsurname><year>, falling back to arxiv<id>.
+    if authors:
+        surname = re.sub(r'[^A-Za-z]', '', authors[0].split()[-1]) or 'arxiv'
+        cite_key = f'{surname}{year}'
+    else:
+        cite_key = f'arxiv{bare.replace(".", "")}'
+
+    categories = paper.get('categories') or []
+    primary_class = categories[0] if categories else ''
+
+    fields = [
+        ('title', paper.get('title', '').strip()),
+        ('author', author_str),
+        ('year', str(year)),
+        ('eprint', bare),
+        ('archivePrefix', 'arXiv'),
+        ('primaryClass', primary_class),
+        ('doi', arxiv_doi(paper.get('arxiv_id'))),
+        ('url', f'https://arxiv.org/abs/{bare}'),
+    ]
+    body = ',\n'.join(f'  {k}={{{v}}}' for k, v in fields if v)
+    return f'@misc{{{cite_key},\n{body}\n}}'
+
+
+@shared_task(name='crawler.tasks.crawl_arxiv_new_papers')
+def crawl_arxiv_new_papers():
+    """Celery task: fetch today's cs.* papers from ArXiv API and save to DB."""
+    logger.info("Starting ArXiv daily crawl task...")
+    today = timezone.now().date()
+
+    start = 0
+    total_created = 0
+
+    while True:
+        logger.info(f"Fetching ArXiv papers batch start={start}...")
+        xml_content = fetch_arxiv_page(start)
+        if not xml_content:
+            logger.warning("Failed to fetch ArXiv page. Stopping.")
+            break
+
+        papers = parse_arxiv_atom(xml_content)
+        if not papers:
+            logger.info("Empty batch returned. Stopping.")
+            break
+
+        batch_urls = [p['url'] for p in papers if 'url' in p]
+        existing_task_urls = set(
+            CrawlTask.objects.filter(url__in=batch_urls).values_list('url', flat=True)
+        )
+        existing_paper_urls = set(
+            Paper.objects.filter(url__in=batch_urls).values_list('url', flat=True)
+        )
+        existing_urls = existing_task_urls | existing_paper_urls
+
+        found_old = False
+        for paper_data in papers:
+            pub_dt = paper_data.get('published_dt')
+            if pub_dt and pub_dt.date() < today:
+                found_old = True
+                break
+
+            url = paper_data.get('url', '')
+            if not url or url in existing_urls:
+                continue
+
+            try:
+                with transaction.atomic():
+                    keywords = extract_keywords_with_llm(paper_data.get('abstract', ''))
+                    # Truncate to fit model field
+                    keywords = keywords[:200]
+
+                    author_objects = []
+                    for name in paper_data.get('authors', []):
+                        author, _ = Author.objects.get_or_create(
+                            name=name,
+                            defaults={
+                                'email': '', 'affiliation': '',
+                                'bio': '', 'google_scholar_url': '',
+                            },
+                        )
+                        author_objects.append(author)
+
+                    category_objects = []
+                    for cat_name in paper_data.get('categories', []):
+                        category, _ = Category.objects.get_or_create(name=cat_name)
+                        category_objects.append(category)
+
+                    arxiv_doi_value = arxiv_doi(paper_data.get('arxiv_id')) or None
+
+                    paper = Paper.objects.create(
+                        title=paper_data.get('title', '[Title Not Found]'),
+                        abstract=paper_data.get('abstract', ''),
+                        doi=arxiv_doi_value,
+                        publication_date=paper_data.get('publication_date') or None,
+                        url=url,
+                        pdf_url=paper_data.get('pdf_url', ''),
+                        keywords=keywords,
+                        file_format='pdf',
+                    )
+
+                    if author_objects:
+                        paper.authors.set(author_objects)
+                    if category_objects:
+                        paper.categories.set(category_objects)
+
+                    CrawlTask.objects.create(url=url, status='completed', paper=paper)
+
+                    total_created += 1
+                    logger.info(f"Saved ArXiv paper: {paper_data.get('title', '')[:80]}")
+
+                # Venue mapping + embed outside the transaction (can be slow).
+                map_paper_venue(paper.id)
+                embed_paper(paper)
+
+            except Exception as e:
+                logger.exception(f"Error saving ArXiv paper {url}: {e}")
+
+        if found_old or len(papers) < ARXIV_BATCH_SIZE:
+            break
+
+        start += ARXIV_BATCH_SIZE
+        time.sleep(ARXIV_BATCH_DELAY)
+
+    logger.info(f"ArXiv crawl finished. Created {total_created} new papers.")
+    return total_created

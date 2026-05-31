@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; $py = \"E:\\\\AI-Assistant-Hust\\\\.venv\\\\Scripts\\\\python.exe\"; & $py manage.py crawl_arxiv --max-papers 3 --no-llm --ignore-date 2>&1 | Select-Object -Last 8)",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; $py = \"E:\\\\AI-Assistant-Hust\\\\.venv\\\\Scripts\\\\python.exe\"; & $py manage.py crawl_arxiv --max-papers 3 --no-llm --ignore-date 2>&1 | Select-Object -Last 7)",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; $py = \"E:\\\\AI-Assistant-Hust\\\\.venv\\\\Scripts\\\\python.exe\"; & $py _diag_arxiv.py)",
+      "Bash(where python *)",
+      "Bash(pip show *)",
+      "Bash(E:/AI-Assistant-Hust/.venv/Scripts/python.exe *)"
+    ]
+  }
+}

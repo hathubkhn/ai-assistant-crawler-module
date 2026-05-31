@@ -156,18 +156,20 @@ CELERY_TIMEZONE = TIME_ZONE
 
 # Celery Beat Settings
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler' # Requires django-celery-beat
-CELERY_BEAT_SCHEDULE = {
-    'run-scheduled-task-every-30-seconds': {
-        'task': 'crawler.tasks.scheduled_task',
-        'schedule': 30.0,  # Run every 30 seconds
-    },
-}
 
+# LLM settings (OpenAI-compatible — defaults point at the internal vLLM server)
+OPENAI_BASE_URL = os.environ.get('OPENAI_BASE_URL', 'http://117.16.0.116:8084/v1')
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', 'EMPTY')
+OPENAI_MODEL = os.environ.get('OPENAI_MODEL', '')
 
 # Celery Beat Settings
 CELERY_BEAT_SCHEDULE = {
     'check-pwc-sitemap': {
         'task': 'crawler.tasks.check_pwc_sitemap',
         'schedule': crontab(hour=1, minute=0),
-    }
+    },
+    'crawl-arxiv-daily': {
+        'task': 'crawler.tasks.crawl_arxiv_new_papers',
+        'schedule': crontab(hour=2, minute=0),
+    },
 }
