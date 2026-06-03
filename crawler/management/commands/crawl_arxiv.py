@@ -1,3 +1,6 @@
+from datetime import timedelta
+
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from django.db import transaction
@@ -5,7 +8,7 @@ from django.db import transaction
 from crawler.models import Paper, Author, Category
 from crawler.tasks import (
     fetch_arxiv_page, parse_arxiv_atom, ARXIV_BATCH_SIZE,
-    arxiv_doi, build_arxiv_bibtex,
+    arxiv_doi, build_arxiv_bibtex, _build_arxiv_query, download_pdf,
 )
 from crawler.parsers import extract_keywords_with_llm
 
@@ -18,14 +21,26 @@ def _keywords_to_list(raw: str) -> list:
 
 
 class Command(BaseCommand):
-    help = 'Crawl ArXiv cs.* papers immediately. Useful for testing.'
+    help = 'Crawl ArXiv cs.* papers for a past date window. Useful for testing.'
 
     def add_arguments(self, parser):
         parser.add_argument(
             '--max-papers',
             type=int,
             default=10,
-            help='Maximum number of papers to crawl (default: 10)',
+            help='Maximum number of papers to crawl (default: 10; 0 = no limit)',
+        )
+        parser.add_argument(
+            '--lookback-start',
+            type=int,
+            default=getattr(settings, 'ARXIV_LOOKBACK_START_DAYS', 5),
+            help='Oldest day of the window (days back from today). Default: settings.ARXIV_LOOKBACK_START_DAYS',
+        )
+        parser.add_argument(
+            '--lookback-end',
+            type=int,
+            default=getattr(settings, 'ARXIV_LOOKBACK_END_DAYS', 3),
+            help='Newest day of the window (days back from today). Default: settings.ARXIV_LOOKBACK_END_DAYS',
         )
         parser.add_argument(
             '--no-llm',
@@ -33,40 +48,44 @@ class Command(BaseCommand):
             help='Skip LLM keyword extraction (faster for testing)',
         )
         parser.add_argument(
-            '--ignore-date',
+            '--download',
             action='store_true',
-            help="Crawl the newest papers regardless of publish date "
-                 "(useful for testing on weekends when ArXiv has no same-day papers)",
+            help='Download PDFs synchronously inline (testing without a Celery worker)',
         )
 
     def handle(self, *args, **options):
         max_papers = options['max_papers']
         skip_llm = options['no_llm']
-        ignore_date = options['ignore_date']
+        do_download = options['download']
         today = timezone.now().date()
+        date_from = today - timedelta(days=options['lookback_start'])
+        date_to = today - timedelta(days=options['lookback_end'])
+        search_query = _build_arxiv_query(date_from, date_to)
+        per_page = int(getattr(settings, 'ARXIV_MAX_RESULTS', ARXIV_BATCH_SIZE))
 
-        self.stdout.write(f'Crawling up to {max_papers} ArXiv papers (date: {today})...')
+        limit = max_papers if max_papers and max_papers > 0 else None
+        self.stdout.write(
+            f'Crawling ArXiv papers submitted {date_from} .. {date_to} '
+            f'(limit: {limit or "no limit"})...'
+        )
         if skip_llm:
             self.stdout.write(self.style.WARNING('LLM keyword extraction disabled.'))
-        if ignore_date:
-            self.stdout.write(self.style.WARNING('Date filter disabled (crawling newest regardless of date).'))
+        if do_download:
+            self.stdout.write(self.style.WARNING('PDF download enabled (synchronous).'))
 
         start = 0
         total_created = 0
 
-        while total_created < max_papers:
-            remaining = max_papers - total_created
-            batch_size = min(remaining, ARXIV_BATCH_SIZE)
-
-            self.stdout.write(f'  Fetching batch start={start}, size={batch_size}...')
-            xml_content = fetch_arxiv_page(start, batch_size)
+        while limit is None or total_created < limit:
+            self.stdout.write(f'  Fetching window page start={start}, size={per_page}...')
+            xml_content = fetch_arxiv_page(start, per_page, search_query=search_query)
             if not xml_content:
                 self.stderr.write(self.style.ERROR('Failed to fetch ArXiv page. Stopping.'))
                 break
 
             papers = parse_arxiv_atom(xml_content)
             if not papers:
-                self.stdout.write('No papers returned. Stopping.')
+                self.stdout.write('No papers returned. Reached end of window.')
                 break
 
             # Dedup against the shared `papers` table only (there is no crawl_tasks table).
@@ -75,14 +94,8 @@ class Command(BaseCommand):
                 Paper.objects.filter(url__in=batch_urls).values_list('url', flat=True)
             )
 
-            found_old = False
             for paper_data in papers:
-                if total_created >= max_papers:
-                    break
-
-                pub_dt = paper_data.get('published_dt')
-                if not ignore_date and pub_dt and pub_dt.date() < today:
-                    found_old = True
+                if limit is not None and total_created >= limit:
                     break
 
                 url = paper_data.get('url', '')
@@ -140,16 +153,20 @@ class Command(BaseCommand):
                         total_created += 1
                         self.stdout.write(
                             self.style.SUCCESS(
-                                f'  [{total_created}/{max_papers}] {paper_data.get("title", "")[:70]}'
+                                f'  [{total_created}] {paper_data.get("title", "")[:70]}'
                             )
                         )
+
+                    # Download outside the transaction (slow / rate-limited).
+                    if do_download and paper.pdf_url:
+                        download_pdf(paper.pdf_url, paper)
 
                 except Exception as e:
                     self.stderr.write(self.style.ERROR(f'  Error saving {url}: {e}'))
 
-            if found_old or len(papers) < batch_size:
+            if len(papers) < per_page:
                 break
 
-            start += batch_size
+            start += per_page
 
         self.stdout.write(self.style.SUCCESS(f'Done. Created {total_created} papers.'))

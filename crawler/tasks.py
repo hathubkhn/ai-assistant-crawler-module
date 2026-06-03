@@ -466,24 +466,116 @@ def crawl_dataset(self, dataset_name: str, dataset_url: str | None = None, paper
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 ARXIV_BATCH_SIZE = 100
 ARXIV_BATCH_DELAY = 3  # seconds between requests
+ARXIV_MAX_RETRIES = 5  # số lần thử lại khi gặp 429 / lỗi mạng
+
+# Throttle toàn cục (trong 1 process) để không vượt giới hạn ~1 req/3s của arXiv.
+_arxiv_last_request_ts = 0.0
 
 
-def fetch_arxiv_page(start: int, max_results: int = ARXIV_BATCH_SIZE) -> str | None:
-    """Fetch one page of ArXiv results for all cs.* categories."""
+def _arxiv_settings():
+    """Đọc cấu hình arXiv từ settings, có fallback an toàn nếu thiếu."""
+    from django.conf import settings
+    return {
+        'url': getattr(settings, 'ARXIV_API_URL', ARXIV_API_URL),
+        'user_agent': getattr(
+            settings, 'ARXIV_USER_AGENT',
+            'HUST-AI-Assistant-Crawler/1.0 (mailto:admin@hust.edu.vn)',
+        ),
+        'min_interval': float(getattr(settings, 'ARXIV_MIN_INTERVAL', ARXIV_BATCH_DELAY)),
+    }
+
+
+def _arxiv_throttle(min_interval: float):
+    """Chặn cho đến khi đã đủ `min_interval` giây kể từ request arXiv gần nhất."""
+    global _arxiv_last_request_ts
+    now = time.monotonic()
+    wait = min_interval - (now - _arxiv_last_request_ts)
+    if wait > 0:
+        time.sleep(wait)
+    _arxiv_last_request_ts = time.monotonic()
+
+
+def _retry_after_seconds(response, attempt: int, min_interval: float) -> float:
+    """Tính thời gian chờ khi bị 429: ưu tiên header Retry-After, nếu không thì backoff lũy thừa."""
+    retry_after = response.headers.get('Retry-After')
+    if retry_after:
+        try:
+            return max(float(retry_after), min_interval)
+        except (TypeError, ValueError):
+            pass
+    # Exponential backoff, chặn trần ở 120s.
+    return min(min_interval * (2 ** attempt), 120)
+
+
+def _build_arxiv_query(date_from=None, date_to=None) -> str:
+    """Tạo search_query cho cs.*, có thể giới hạn theo cửa sổ submittedDate (UTC, bao gồm 2 đầu).
+
+    date_from / date_to là `datetime.date`. arXiv dùng định dạng [YYYYMMDDHHMM TO YYYYMMDDHHMM].
+    """
+    base = 'cat:cs.*'
+    if date_from and date_to:
+        start = date_from.strftime('%Y%m%d') + '0000'
+        end = date_to.strftime('%Y%m%d') + '2359'
+        return f'{base} AND submittedDate:[{start} TO {end}]'
+    return base
+
+
+def fetch_arxiv_page(start: int, max_results: int = ARXIV_BATCH_SIZE,
+                     search_query: str | None = None) -> str | None:
+    """Fetch one page of ArXiv results.
+
+    Gửi kèm User-Agent định danh (bắt buộc với arXiv), throttle tối thiểu giữa
+    các request, và retry có backoff tôn trọng header Retry-After khi gặp 429.
+    `search_query` mặc định là toàn bộ cs.*; truyền vào để lọc theo cửa sổ ngày.
+    """
+    cfg = _arxiv_settings()
     params = {
-        'search_query': 'cat:cs.*',
+        'search_query': search_query or 'cat:cs.*',
         'sortBy': 'submittedDate',
         'sortOrder': 'descending',
         'max_results': max_results,
         'start': start,
     }
-    try:
-        response = requests.get(ARXIV_API_URL, params=params, timeout=60)
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException as e:
-        logger.error(f"Error fetching ArXiv page (start={start}): {e}")
-        return None
+    headers = {
+        'User-Agent': cfg['user_agent'],
+        'Accept': 'application/atom+xml',
+    }
+
+    for attempt in range(ARXIV_MAX_RETRIES):
+        _arxiv_throttle(cfg['min_interval'])
+        try:
+            response = requests.get(
+                cfg['url'], params=params, headers=headers, timeout=60
+            )
+
+            if response.status_code == 429:
+                wait = _retry_after_seconds(response, attempt, cfg['min_interval'])
+                logger.warning(
+                    f"ArXiv 429 (start={start}, attempt {attempt + 1}/{ARXIV_MAX_RETRIES}). "
+                    f"Waiting {wait:.0f}s before retry..."
+                )
+                time.sleep(wait)
+                continue
+
+            response.raise_for_status()
+            return response.text
+
+        except requests.RequestException as e:
+            if attempt < ARXIV_MAX_RETRIES - 1:
+                wait = min(cfg['min_interval'] * (2 ** attempt), 120)
+                logger.warning(
+                    f"Error fetching ArXiv page (start={start}, attempt {attempt + 1}): {e}. "
+                    f"Retrying in {wait:.0f}s..."
+                )
+                time.sleep(wait)
+            else:
+                logger.error(
+                    f"Error fetching ArXiv page (start={start}) after "
+                    f"{ARXIV_MAX_RETRIES} attempts: {e}"
+                )
+
+    logger.error(f"Giving up fetching ArXiv page (start={start}) after rate-limit retries.")
+    return None
 
 
 def parse_arxiv_atom(xml_content: str) -> list[dict]:
@@ -608,52 +700,81 @@ def build_arxiv_bibtex(paper: dict) -> str:
     return f'@misc{{{cite_key},\n{body}\n}}'
 
 
+def _keywords_to_list(raw: str) -> list:
+    """Chuẩn hoá chuỗi keyword comma-separated từ LLM thành list (khớp jsonb column)."""
+    if not raw:
+        return []
+    return [k.strip() for k in raw.split(',') if k.strip()]
+
+
 @shared_task(name='crawler.tasks.crawl_arxiv_new_papers')
-def crawl_arxiv_new_papers():
-    """Celery task: fetch today's cs.* papers from ArXiv API and save to DB."""
-    logger.info("Starting ArXiv daily crawl task...")
+def crawl_arxiv_new_papers(lookback_start_days: int | None = None,
+                           lookback_end_days: int | None = None,
+                           download_pdfs: bool = True):
+    """Celery task: cào TOÀN BỘ paper cs.* submit trong cửa sổ [today-start, today-end].
+
+    Lùi vài ngày (mặc định 3-5 ngày trước) để metadata trên arXiv đã đầy đủ/ổn định.
+    Phân trang trong cửa sổ (đã được lọc server-side theo submittedDate) cho đến khi
+    hết bài — mọi request đều qua `fetch_arxiv_page` đã throttle + retry 429.
+
+    Việc tải PDF được TÁCH thành task riêng (`download_paper_pdf`) dispatch bằng
+    `.delay()`, nên luồng cào metadata không bị nghẽn bởi download chậm/bị rate-limit.
+
+    Args:
+        lookback_start_days: Mốc xa nhất (số ngày lùi). None -> settings.ARXIV_LOOKBACK_START_DAYS.
+        lookback_end_days: Mốc gần nhất (số ngày lùi). None -> settings.ARXIV_LOOKBACK_END_DAYS.
+        download_pdfs: Nếu True, dispatch task tải PDF cho từng paper mới.
+    """
+    from django.conf import settings
+    from datetime import timedelta
+
+    if lookback_start_days is None:
+        lookback_start_days = int(getattr(settings, 'ARXIV_LOOKBACK_START_DAYS', 5))
+    if lookback_end_days is None:
+        lookback_end_days = int(getattr(settings, 'ARXIV_LOOKBACK_END_DAYS', 3))
+
     today = timezone.now().date()
+    date_from = today - timedelta(days=lookback_start_days)
+    date_to = today - timedelta(days=lookback_end_days)
+    search_query = _build_arxiv_query(date_from, date_to)
+    per_page = int(getattr(settings, 'ARXIV_MAX_RESULTS', ARXIV_BATCH_SIZE))
+
+    logger.info(
+        f"Starting ArXiv crawl for submittedDate window {date_from} .. {date_to} "
+        f"(per_page={per_page}, download_pdfs={download_pdfs})..."
+    )
 
     start = 0
     total_created = 0
 
     while True:
-        logger.info(f"Fetching ArXiv papers batch start={start}...")
-        xml_content = fetch_arxiv_page(start)
+        logger.info(f"Fetching ArXiv window page start={start}...")
+        xml_content = fetch_arxiv_page(start, per_page, search_query=search_query)
         if not xml_content:
             logger.warning("Failed to fetch ArXiv page. Stopping.")
             break
 
         papers = parse_arxiv_atom(xml_content)
         if not papers:
-            logger.info("Empty batch returned. Stopping.")
+            logger.info("Empty page returned. Reached end of window.")
             break
 
+        # Dedup chỉ trên bảng `papers` (KHÔNG có bảng crawl_tasks trong DB dùng chung).
         batch_urls = [p['url'] for p in papers if 'url' in p]
-        existing_task_urls = set(
-            CrawlTask.objects.filter(url__in=batch_urls).values_list('url', flat=True)
-        )
-        existing_paper_urls = set(
+        existing_urls = set(
             Paper.objects.filter(url__in=batch_urls).values_list('url', flat=True)
         )
-        existing_urls = existing_task_urls | existing_paper_urls
 
-        found_old = False
         for paper_data in papers:
-            pub_dt = paper_data.get('published_dt')
-            if pub_dt and pub_dt.date() < today:
-                found_old = True
-                break
-
             url = paper_data.get('url', '')
             if not url or url in existing_urls:
                 continue
 
             try:
                 with transaction.atomic():
-                    keywords = extract_keywords_with_llm(paper_data.get('abstract', ''))
-                    # Truncate to fit model field
-                    keywords = keywords[:200]
+                    keywords = _keywords_to_list(
+                        extract_keywords_with_llm(paper_data.get('abstract', ''))
+                    )
 
                     author_objects = []
                     for name in paper_data.get('authors', []):
@@ -671,16 +792,17 @@ def crawl_arxiv_new_papers():
                         category, _ = Category.objects.get_or_create(name=cat_name)
                         category_objects.append(category)
 
-                    arxiv_doi_value = arxiv_doi(paper_data.get('arxiv_id')) or None
+                    doi = paper_data.get('doi') or arxiv_doi(paper_data.get('arxiv_id')) or None
 
                     paper = Paper.objects.create(
                         title=paper_data.get('title', '[Title Not Found]'),
                         abstract=paper_data.get('abstract', ''),
-                        doi=arxiv_doi_value,
+                        doi=doi,
                         publication_date=paper_data.get('publication_date') or None,
                         url=url,
                         pdf_url=paper_data.get('pdf_url', ''),
                         keywords=keywords,
+                        bibtex=build_arxiv_bibtex(paper_data),
                         file_format='pdf',
                     )
 
@@ -689,23 +811,52 @@ def crawl_arxiv_new_papers():
                     if category_objects:
                         paper.categories.set(category_objects)
 
-                    CrawlTask.objects.create(url=url, status='completed', paper=paper)
-
                     total_created += 1
                     logger.info(f"Saved ArXiv paper: {paper_data.get('title', '')[:80]}")
 
-                # Venue mapping + embed outside the transaction (can be slow).
+                # Ngoài transaction (có thể chậm). PDF tách hẳn sang task riêng.
                 map_paper_venue(paper.id)
                 embed_paper(paper)
+                if download_pdfs and paper.pdf_url:
+                    download_paper_pdf.delay(str(paper.id))
 
             except Exception as e:
                 logger.exception(f"Error saving ArXiv paper {url}: {e}")
 
-        if found_old or len(papers) < ARXIV_BATCH_SIZE:
+        # Hết cửa sổ khi trang cuối trả về ít hơn per_page.
+        if len(papers) < per_page:
             break
-
-        start += ARXIV_BATCH_SIZE
-        time.sleep(ARXIV_BATCH_DELAY)
+        start += per_page
 
     logger.info(f"ArXiv crawl finished. Created {total_created} new papers.")
     return total_created
+
+
+# --- Tách luồng tải PDF thành task độc lập --- #
+@shared_task(name='crawler.tasks.download_paper_pdf', bind=True,
+             max_retries=3, default_retry_delay=300)
+def download_paper_pdf(self, paper_id):
+    """Tải PDF cho một Paper đã có sẵn (chạy độc lập với luồng cào metadata).
+
+    Tách riêng để khi auto-crawl, luồng metadata cào được toàn bộ paper mới mà
+    không bị nghẽn bởi download chậm / 429 ở phía PDF.
+    """
+    try:
+        paper = Paper.objects.get(pk=paper_id)
+    except Paper.DoesNotExist:
+        logger.error(f"Paper {paper_id} not found. Skipping PDF download.")
+        return
+
+    if not paper.pdf_url:
+        logger.info(f"Paper {paper_id} has no pdf_url. Skipping.")
+        return
+
+    if paper.pdf_file:
+        logger.info(f"Paper {paper_id} already has a PDF file. Skipping.")
+        return
+
+    try:
+        download_pdf(paper.pdf_url, paper)
+    except Exception as e:
+        logger.warning(f"PDF download failed for Paper {paper_id}: {e}. Retrying...")
+        raise self.retry(exc=e)

@@ -162,6 +162,23 @@ OPENAI_BASE_URL = os.environ.get('OPENAI_BASE_URL', 'http://117.16.0.116:8084/v1
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', 'EMPTY')
 OPENAI_MODEL = os.environ.get('OPENAI_MODEL', '')
 
+# ArXiv API settings
+# arXiv yêu cầu một User-Agent định danh được + tối đa ~1 request / 3 giây.
+# Thiếu User-Agent là nguyên nhân chính gây lỗi 429. Nên đặt email liên hệ thật.
+ARXIV_API_URL = os.environ.get('ARXIV_API_URL', 'https://export.arxiv.org/api/query')
+ARXIV_USER_AGENT = os.environ.get(
+    'ARXIV_USER_AGENT',
+    'HUST-AI-Assistant-Crawler/1.0 (+https://hust.edu.vn; mailto:admin@hust.edu.vn)',
+)
+# Số kết quả lấy về trong MỘT request (kích thước trang khi phân trang).
+ARXIV_MAX_RESULTS = int(os.environ.get('ARXIV_MAX_RESULTS', '200'))
+# Khoảng cách tối thiểu giữa 2 request tới arXiv (giây).
+ARXIV_MIN_INTERVAL = float(os.environ.get('ARXIV_MIN_INTERVAL', '3'))
+# Cửa sổ ngày để cào (lùi về quá khứ để metadata đã đầy đủ/ổn định trên arXiv).
+# Cào các bài submit trong khoảng [today - START, today - END].
+ARXIV_LOOKBACK_START_DAYS = int(os.environ.get('ARXIV_LOOKBACK_START_DAYS', '5'))  # mốc xa nhất
+ARXIV_LOOKBACK_END_DAYS = int(os.environ.get('ARXIV_LOOKBACK_END_DAYS', '3'))      # mốc gần nhất
+
 # Celery Beat Settings
 CELERY_BEAT_SCHEDULE = {
     'check-pwc-sitemap': {
