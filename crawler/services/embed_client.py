@@ -58,6 +58,12 @@ def _paper_payload(paper) -> dict:
 
 
 def embed_paper(paper, *, timeout: int = DEFAULT_TIMEOUT) -> bool:
+    # After create(), in-memory publication_date may still be a str; reload from DB.
+    try:
+        paper.refresh_from_db()
+    except Exception as exc:
+        logger.warning("embed_paper refresh_from_db failed for paper_id=%s: %s", paper.id, exc)
+
     try:
         resp = requests.post(
             f"{_assistant_url()}/papers",
