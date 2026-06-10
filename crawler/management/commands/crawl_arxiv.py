@@ -11,6 +11,8 @@ from crawler.tasks import (
     arxiv_doi, build_arxiv_bibtex, _build_arxiv_query, download_pdf,
 )
 from crawler.parsers import extract_keywords_with_llm
+from crawler.services.embed_client import embed_paper
+from crawler.services.venue_client import map_paper_venue
 
 
 def _keywords_to_list(raw: str) -> list:
@@ -156,11 +158,19 @@ class Command(BaseCommand):
                                 f'  [{total_created}] {paper_data.get("title", "")[:70]}'
                             )
                         )
-
+                        
                     # Download outside the transaction (slow / rate-limited).
                     if do_download and paper.pdf_url:
                         download_pdf(paper.pdf_url, paper)
-
+                            # Venue mapping + embed (same as Celery ArXiv task; outside transaction).
+                    if map_paper_venue(paper.id):
+                        self.stdout.write('    venue mapping: ok')
+                    else:
+                        self.stdout.write(self.style.WARNING('    venue mapping: skipped/failed'))
+                    if embed_paper(paper):
+                        self.stdout.write('    embed: ok')
+                    else:
+                        self.stdout.write(self.style.WARNING('    embed: skipped/failed'))        
                 except Exception as e:
                     self.stderr.write(self.style.ERROR(f'  Error saving {url}: {e}'))
 
