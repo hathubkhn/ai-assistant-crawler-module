@@ -1,0 +1,111 @@
+# Local crawler worker + beat. Uses the shared DB/Redis/backend from repo-root stack.
+#
+# 1) Start main stack first:
+#      cd .. && docker compose -f docker-compose.local.yml up -d
+# 2) Start crawler worker:
+#      docker compose -f docker-compose.local.yml up -d --build
+# 3) Optional auto-schedule (Beat reads PeriodicTask from DB):
+#      docker compose -f docker-compose.local.yml --profile beat up -d crawler-beat
+# 4) One-off crawl test (no worker):
+#      docker compose -f docker-compose.local.yml --profile run run --rm crawler-run \
+#        python manage.py crawl_arxiv --max-papers 5 --no-llm --lookback-start 7 --lookback-end 0
+#
+# Copy crawler_service/.env.example → .env and set OPENAI_API_KEY.
+
+name: crawler-local
+
+services:
+  crawler-migrate:
+    build: .
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-research_paper_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    command: >
+      sh -c "python manage.py migrate crawler --fake --noinput &&
+             python manage.py migrate django_celery_beat --noinput &&
+             python manage.py setup_celery_beat --test-interval-minutes 60"
+    networks:
+      - ai-research
+    restart: "no"
+
+  crawler-worker:
+    build: .
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-research_paper_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      BACKEND_API_URL: http://backend:8000
+      RESEARCH_ASSISTANT_URL: http://research-assistant:8001
+      INTERNAL_VENUE_MAP_KEY: ${INTERNAL_VENUE_MAP_KEY:-local-dev-internal}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+    command: celery -A crawler_service worker -l info
+    depends_on:
+      crawler-migrate:
+        condition: service_completed_successfully
+    networks:
+      - ai-research
+    restart: unless-stopped
+
+  crawler-beat:
+    profiles: ["beat"]
+    build: .
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-research_paper_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    command: celery -A crawler_service beat -l info
+    depends_on:
+      crawler-migrate:
+        condition: service_completed_successfully
+      crawler-worker:
+        condition: service_started
+    networks:
+      - ai-research
+    restart: unless-stopped
+
+  crawler-run:
+    profiles: ["run"]
+    build: .
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-research_paper_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      BACKEND_API_URL: http://backend:8000
+      RESEARCH_ASSISTANT_URL: http://research-assistant:8001
+      INTERNAL_VENUE_MAP_KEY: ${INTERNAL_VENUE_MAP_KEY:-local-dev-internal}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+    networks:
+      - ai-research
+    restart: "no"
+
+networks:
+  ai-research:
+    external: true
+    name: ai-research-local_default

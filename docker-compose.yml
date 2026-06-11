@@ -25,6 +25,75 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  crawler-migrate:
+    build: .
+    container_name: crawler_migrate
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    command: >
+      sh -c "python manage.py migrate django_celery_beat --noinput &&
+             python manage.py migrate crawler --fake --noinput &&
+             python manage.py setup_celery_beat"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+  crawler-worker:
+    build: .
+    container_name: crawler_worker
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      BACKEND_API_URL: ${BACKEND_API_URL}
+      RESEARCH_ASSISTANT_URL: ${RESEARCH_ASSISTANT_URL}
+      INTERNAL_VENUE_MAP_KEY: ${INTERNAL_VENUE_MAP_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      ARXIV_USER_AGENT: ${ARXIV_USER_AGENT}
+    command: celery -A crawler_service worker -l info --concurrency=2
+    volumes:
+      - /home/hust/data:/home/hust/data
+    depends_on:
+      crawler-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  crawler-beat:
+    build: .
+    container_name: crawler_beat
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    command: celery -A crawler_service beat -l info
+    depends_on:
+      crawler-migrate:
+        condition: service_completed_successfully
+      crawler-worker:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
   redis_data:
