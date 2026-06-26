@@ -1,7 +1,7 @@
 import json
 from django.core.management.base import BaseCommand
 from django.core import serializers
-from crawler.models import Paper, Author, Dataset, Category, CrawlTask
+from crawler.models import Paper, Author, Category
 import os
 from tqdm import tqdm
 
@@ -14,12 +14,11 @@ class Command(BaseCommand):
             os.makedirs('exports')
 
         # Dictionary mapping model classes to their table names
+        # ArXiv/shared tables only (PWC CrawlTask/Dataset omitted — no crawl_tasks table).
         models = {
             Paper: 'papers',
             Author: 'authors',
-            Dataset: 'datasets',
             Category: 'categories',
-            CrawlTask: 'crawl_tasks'
         }
 
         total_records = 0
