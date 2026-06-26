@@ -181,10 +181,11 @@ ARXIV_LOOKBACK_END_DAYS = int(os.environ.get('ARXIV_LOOKBACK_END_DAYS', '3'))   
 
 # Celery Beat Settings
 CELERY_BEAT_SCHEDULE = {
-    'check-pwc-sitemap': {
-        'task': 'crawler.tasks.check_pwc_sitemap',
-        'schedule': crontab(hour=1, minute=0),
-    },
+    # [PWC DISABLED] Shared DB has no `crawl_tasks` table (CrawlTask); PWC not implemented yet.
+    # 'check-pwc-sitemap': {
+    #     'task': 'crawler.tasks.check_pwc_sitemap',
+    #     'schedule': crontab(hour=1, minute=0),
+    # },
     'crawl-arxiv-daily': {
         'task': 'crawler.tasks.crawl_arxiv_new_papers',
         'schedule': crontab(hour=2, minute=0),

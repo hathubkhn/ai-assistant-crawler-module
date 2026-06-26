@@ -159,10 +159,10 @@ class Command(BaseCommand):
                             )
                         )
                         
-                    # Download outside the transaction (slow / rate-limited).
-                    if do_download and paper.pdf_url:
-                        download_pdf(paper.pdf_url, paper)
-                            # Venue mapping + embed (same as Celery ArXiv task; outside transaction).
+                    # Download disabled — use pdf_url (ArXiv); local file only via user upload.
+                    # if do_download and paper.pdf_url:
+                    #     download_pdf(paper.pdf_url, paper)
+                    # Venue mapping + embed (same as Celery ArXiv task; outside transaction).
                     if map_paper_venue(paper.id):
                         self.stdout.write('    venue mapping: ok')
                     else:

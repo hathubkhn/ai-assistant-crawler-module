@@ -36,6 +36,10 @@ class Command(BaseCommand):
         from celery.schedules import crontab
 
         created = 0
+        active_names = set(settings.CELERY_BEAT_SCHEDULE.keys())
+        # Interval test task from --test-interval-minutes; not a crontab entry in settings.
+        exempt_names = {'crawl-arxiv-local-test'}
+
         for name, entry in settings.CELERY_BEAT_SCHEDULE.items():
             schedule = entry["schedule"]
             if not isinstance(schedule, crontab):
@@ -52,6 +56,19 @@ class Command(BaseCommand):
             )
             created += 1
             self.stdout.write(f"{'Created' if was_created else 'Updated'} periodic task: {name}")
+
+        disabled_count = (
+            PeriodicTask.objects.filter(crontab__isnull=False)
+            .exclude(name__in=active_names | exempt_names)
+            .update(enabled=False)
+        )
+        if disabled_count:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Disabled {disabled_count} stale crontab periodic task(s) "
+                    f"not in CELERY_BEAT_SCHEDULE."
+                )
+            )
 
         test_mins = options["test_interval_minutes"]
         if test_mins and test_mins > 0:

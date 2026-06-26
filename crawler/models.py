@@ -93,9 +93,11 @@ class TaskPaper(models.Model):
 
 
 class Dataset(models.Model):
-    """Kept as an unmanaged stub so existing imports (tasks.py) keep working.
-    The real datasets live in `public_api_dataset` with a different schema;
-    the ArXiv crawl does not touch datasets."""
+    """[PWC DISABLED] Stub for Papers With Code dataset crawl only.
+
+    Shared DB uses `public_api_dataset` (backend schema), not `datasets`.
+    Not used while PWC crawl is disabled (no CrawlTask / crawl_tasks table).
+    """
     name = models.CharField(max_length=300, unique=True)
     description = models.TextField(blank=True)
     crawled_url = models.URLField(max_length=500, blank=True, null=True)
@@ -117,9 +119,11 @@ class Dataset(models.Model):
 
 
 class CrawlTask(models.Model):
-    """Kept as an unmanaged stub so existing imports (tasks.py) keep working.
-    There is NO `crawl_tasks` table in the shared DB, so this must NOT be queried.
-    The ArXiv crawl deduplicates on `Paper.url` instead."""
+    """[PWC DISABLED] Stub for PWC crawl orchestration only.
+
+    There is NO `crawl_tasks` table in the shared DB — do not query in production.
+    ArXiv crawl deduplicates on `Paper.url` instead. Kept for tests / future refactor.
+    """
     STATUS_CHOICES = [
         ('pending', 'Pending'),
         ('crawling', 'Crawling'),
