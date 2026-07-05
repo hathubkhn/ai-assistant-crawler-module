@@ -17,297 +17,295 @@ from .services.venue_client import map_paper_venue
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# [PWC DISABLED] Shared DB has no `crawl_tasks` table (CrawlTask). PWC crawl is
-# not implemented on the shared database yet. Re-enable after refactor (dedup
-# via Paper.url, same pattern as ArXiv). Code below is kept but not executed.
+# [PWC DISABLED] Papers With Code crawl — preserved below (commented out).
+# Shared DB has no crawl_tasks table; ArXiv dedup uses Paper.url instead.
 # =============================================================================
-if False:
-    from urllib.parse import urlparse
-    import tqdm
-    from .models import CrawlTask, Dataset
-    from .parsers import fetch_sitemap_content, parse_paper_page_html, parse_dataset_page
-
-    # URL for the Papers With Code sitemap
-    PWC_SITEMAP_URL = "https://paperswithcode.com/sitemap.xml"
-    PWC_DOMAIN = "paperswithcode.com"
-    PWC_PAPER_PATH_PREFIX = "/paper/"
-    PWC_BASE_URL = f'https://{PWC_DOMAIN}'
-
-    def fetch_sitemap(url: str) -> str | None:
-        """Fetches content from the given URL. Returns text content or None on error."""
-        try:
-            response = requests.get(url, timeout=300)
-            response.raise_for_status()
-            logger.info(f"Successfully fetched sitemap from {url}")
-            return response.text
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching sitemap from {url}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"An unexpected error occurred fetching sitemap {url}: {e}")
-            return None
-
-    @shared_task(name='crawler.tasks.check_pwc_sitemap')
-    def check_pwc_sitemap_and_create_tasks():
-        """Celery task to fetch PWC sitemap, parse new papers, and create crawl tasks."""
-        logger.info("Starting PWC sitemap check task...")
-
-        sitemap_content = fetch_sitemap(PWC_SITEMAP_URL)
-        if not sitemap_content:
-            logger.warning("Failed to fetch PWC sitemap content. Task exiting.")
-            return
-
-        logger.info("Parsing PWC sitemap content...")
-        try:
-            root = ET.fromstring(sitemap_content)
-            paper_sitemaps = []
-            for loc_element in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc'):
-                if loc_element.text and 'sitemap-papers.xml' in loc_element.text:
-                    paper_sitemaps.append(loc_element.text)
-
-            for sub_sitemap_url in tqdm.tqdm(paper_sitemaps):
-                sub_content = fetch_sitemap_content(sub_sitemap_url)
-                parsed_urls, new_parsed_urls = [], []
-                if not sub_content:
-                    continue
-
-                try:
-                    sub_root = ET.fromstring(sub_content)
-                    for loc_element in sub_root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc'):
-                        if loc_element.text:
-                            url = loc_element.text.strip()
-                            parsed_url = urlparse(url)
-                            if (parsed_url.netloc == PWC_DOMAIN and
-                                    parsed_url.path.startswith(PWC_PAPER_PATH_PREFIX)):
-                                parsed_urls.append(url)
-
-                        if len(parsed_urls) == 500:
-                            existing_urls = set(
-                                CrawlTask.objects.filter(url__in=parsed_urls)
-                                            .values_list('url', flat=True)
-                            )
-                            new_parsed_urls = list(set(parsed_urls) - existing_urls)
-                            parsed_urls = []
-
-                    for url in new_parsed_urls:
-                        new_task = CrawlTask(url=url, status='pending')
-                        new_task.save()
-                        crawl_paper_details.delay(new_task.id)
-
-                except ET.ParseError as e:
-                    logger.error(f"Error parsing sub-sitemap {sub_sitemap_url}: {e}")
-                    continue
-
-        except ET.ParseError as e:
-            logger.error(f"Error parsing main sitemap XML: {e}")
-            return 0
-        except Exception as e:
-            logger.exception("An unexpected error occurred during sitemap parsing")
-            return 0
-
-        logger.info("PWC sitemap check task finished.")
-
-    # --- Paper Crawling Task (PWC) --- #
-    @shared_task(name='crawler.tasks.crawl_paper', bind=True, max_retries=3, default_retry_delay=60)
-    def crawl_paper_details(self, task_id: int):
-        """Celery task to crawl details for a single paper given a CrawlTask ID."""
-        logger.info(f"Starting paper crawl for CrawlTask ID: {task_id}")
-
-        try:
-            task = CrawlTask.objects.get(pk=task_id)
-        except CrawlTask.DoesNotExist:
-            logger.error(f"CrawlTask with ID {task_id} not found. Task cannot proceed.")
-            return
-        except Exception as e:
-            logger.exception(f"Error retrieving CrawlTask ID {task_id}. Retrying...")
-            raise self.retry(exc=e)
-
-        if task.status != 'pending':
-            logger.warning(f"CrawlTask ID {task_id} is not in pending state (state={task.status}). Skipping crawl.")
-            return
-
-        # 1. Fetch HTML Content
-        html_content = None
-        try:
-            response = requests.get(task.url, timeout=300)
-            response.raise_for_status()
-            html_content = response.text
-            logger.info(f"Successfully fetched content from {task.url}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"HTTP error fetching {task.url} for Task ID {task_id}: {e}. Retrying...")
-            raise self.retry(exc=e)
-        except Exception as e:
-            logger.exception(f"Unexpected error fetching {task.url} for Task ID {task_id}. Failing task.")
-            task.status = 'failed'
-            task.save(update_fields=['status', 'updated_at'])
-            return
-
-        # 2. Parse HTML Content
-        parsed_data = None
-        try:
-            parsed_data = parse_paper_page_html(html_content, base_url=task.url)
-            if not parsed_data:
-                raise ValueError("Parser returned None or empty data.")
-            logger.info(f"Successfully parsed content for Task ID {task_id}")
-        except Exception as e:
-            logger.exception(f"Error parsing HTML content for Task ID {task_id}. Failing task.")
-            task.status = 'failed'
-            task.save(update_fields=['status', 'updated_at'])
-            return
-
-        # 3. Create/Update Database Records (within a transaction)
-        new_paper = None
-        try:
-            with transaction.atomic():
-                author_objects = []
-                for author_name in parsed_data.get('authors', []):
-                    if not author_name or not isinstance(author_name, str):
-                        logger.warning(f"Skipping invalid author name: {author_name}")
-                        continue
-                    try:
-                        author, created = Author.objects.get_or_create(name=author_name.strip())
-                        author_objects.append(author)
-                        if created:
-                            logger.info(f"Created new Author: {author_name}")
-                    except Exception as author_ex:
-                        logger.error(f"Error getting/creating author '{author_name}': {author_ex}")
-
-                category_objects = []
-                for category_name in parsed_data.get('categories', []):
-                    if not category_name or not isinstance(category_name, str):
-                        logger.warning(f"Skipping invalid category name: {category_name}")
-                        continue
-                    try:
-                        category = Category.objects.filter(name=category_name.strip()).first()
-                        if not category:
-                            category = Category.objects.create(name=category_name.strip())
-                        category_objects.append(category)
-                        logger.info(f"Created new Category: {category_name}")
-                    except Exception as cat_ex:
-                        logger.error(f"Error getting/creating category '{category_name}': {cat_ex}")
-
-                dataset_objects = []
-                for dataset_info in parsed_data.get('datasets', []):
-                    if not isinstance(dataset_info, dict) or 'name' not in dataset_info:
-                        logger.warning(f"Skipping invalid dataset info: {dataset_info}")
-                        continue
-                    try:
-                        dataset_id = crawl_dataset(
-                            dataset_name=dataset_info['name'].strip(),
-                            dataset_url=dataset_info.get('url', ''),
-                        )
-                        logger.info(f"Completed dataset crawling for {dataset_info['name']}")
-                        dataset = Dataset.objects.get(id=dataset_id)
-                        dataset_objects.append(dataset)
-                    except Exception as ds_ex:
-                        logger.error(f"Error processing dataset '{dataset_info}': {ds_ex}")
-
-                paper_data = {
-                    'title': parsed_data.get('title', '[Title Not Found]'),
-                    'abstract': parsed_data.get('abstract', '[Abstract Not Found]'),
-                    'doi': parsed_data.get('doi'),
-                    'publication_date': parsed_data.get('publication_date'),
-                    'journal_or_conference': parsed_data.get('journal_or_conference', ''),
-                    'file_format': parsed_data.get('file_format', 'pdf'),
-                    'keywords': list(parsed_data.get('keywords', []) or []),
-                    'url': task.url,
-                    'pdf_url': parsed_data.get('pdf_url'),
-                    'github_url': parsed_data.get('github_url'),
-                    'download_count': parsed_data.get('download_count', 0),
-                    'views_count': parsed_data.get('views_count', 0),
-                    'citations_count': parsed_data.get('citations_count', 0)
-                }
-                paper_data = {k: v for k, v in paper_data.items() if v is not None}
-
-                new_paper = Paper.objects.create(**paper_data)
-                logger.info(f"Created Paper record ID {new_paper.id} for Task ID {task_id}")
-
-                if author_objects:
-                    new_paper.authors.set(author_objects)
-                if category_objects:
-                    new_paper.categories.set(category_objects)
-                if dataset_objects:
-                    new_paper.datasets.set(dataset_objects)
-
-                if parsed_data.get('references'):
-                    existing_papers = Paper.objects.filter(doi__in=parsed_data['references'])
-                    if existing_papers.exists():
-                        new_paper.references.set(existing_papers)
-
-                task.paper = new_paper
-                task.status = 'completed'
-                task.updated_at = timezone.now()
-                task.save(update_fields=['paper', 'status', 'updated_at'])
-                logger.info(f"Successfully completed DB operations for CrawlTask ID: {task_id}")
-
-        except Exception as e:
-            logger.exception(f"Database error during record creation/update for Task ID {task_id}. Retrying...")
-            raise self.retry(exc=e)
-
-        if new_paper:
-            map_paper_venue(new_paper.id)
-            embed_paper(new_paper)
-
-        logger.info(f"Paper crawl task finished for Task ID: {task_id}")
-
-    # --- Dataset Crawling Task (PWC) --- #
-    @shared_task(name='crawler.tasks.crawl_dataset', bind=True, max_retries=3, default_retry_delay=60)
-    def crawl_dataset(self, dataset_name: str, dataset_url: str | None = None, paper_id: int | None = None):
-        """Celery task to crawl dataset information and create/update dataset record."""
-        logger.info(f"Starting dataset crawl for: {dataset_name}")
-
-        try:
-            dataset = Dataset.objects.filter(name=dataset_name).first()
-
-            if dataset:
-                logger.info(f"Found existing dataset: {dataset_name}")
-                if paper_id:
-                    paper = Paper.objects.get(id=paper_id)
-                    dataset.papers.add(paper)
-                return dataset.id
-
-            if dataset_url:
-                try:
-                    response = requests.get(dataset_url, timeout=60)
-                    response.raise_for_status()
-                    dataset_data = parse_dataset_page(response.text, dataset_url)
-
-                    if dataset_data:
-                        dataset = Dataset.objects.create(
-                            name=dataset_name,
-                            description=dataset_data.get('description', ''),
-                            crawled_url=dataset_data.get('crawled_url', ''),
-                            url=dataset_data.get('url', ''),
-                            modalities=dataset_data.get('modalities', ''),
-                            languages=dataset_data.get('languages', ''),
-                            licenses=dataset_data.get('licenses', ''),
-                            tasks=dataset_data.get('tasks', '')
-                        )
-                        if paper_id:
-                            paper = Paper.objects.get(id=paper_id)
-                            dataset.papers.add(paper)
-                    else:
-                        dataset = Dataset.objects.create(name=dataset_name, crawled_url=dataset_url)
-                        if paper_id:
-                            paper = Paper.objects.get(id=paper_id)
-                            dataset.papers.add(paper)
-                except requests.RequestException as e:
-                    logger.error(f"Error fetching dataset page for {dataset_name}: {e}")
-                    dataset = Dataset.objects.create(name=dataset_name, crawled_url=dataset_url)
-                    if paper_id:
-                        paper = Paper.objects.get(id=paper_id)
-                        dataset.papers.add(paper)
-            else:
-                dataset = Dataset.objects.create(name=dataset_name)
-                if paper_id:
-                    paper = Paper.objects.get(id=paper_id)
-                    dataset.papers.add(paper)
-
-            return dataset.id
-
-        except Exception as e:
-            logger.exception(f"Error processing dataset {dataset_name}: {e}")
-            raise self.retry(exc=e)
+    # from urllib.parse import urlparse
+    # import tqdm
+    # from .models import CrawlTask, Dataset
+    # from .parsers import fetch_sitemap_content, parse_paper_page_html, parse_dataset_page
+# 
+    # # URL for the Papers With Code sitemap
+    # PWC_SITEMAP_URL = "https://paperswithcode.com/sitemap.xml"
+    # PWC_DOMAIN = "paperswithcode.com"
+    # PWC_PAPER_PATH_PREFIX = "/paper/"
+    # PWC_BASE_URL = f'https://{PWC_DOMAIN}'
+# 
+    # def fetch_sitemap(url: str) -> str | None:
+        # """Fetches content from the given URL. Returns text content or None on error."""
+        # try:
+            # response = requests.get(url, timeout=300)
+            # response.raise_for_status()
+            # logger.info(f"Successfully fetched sitemap from {url}")
+            # return response.text
+        # except requests.exceptions.RequestException as e:
+            # logger.error(f"Error fetching sitemap from {url}: {e}")
+            # return None
+        # except Exception as e:
+            # logger.error(f"An unexpected error occurred fetching sitemap {url}: {e}")
+            # return None
+# 
+    # @shared_task(name='crawler.tasks.check_pwc_sitemap')
+    # def check_pwc_sitemap_and_create_tasks():
+        # """Celery task to fetch PWC sitemap, parse new papers, and create crawl tasks."""
+        # logger.info("Starting PWC sitemap check task...")
+# 
+        # sitemap_content = fetch_sitemap(PWC_SITEMAP_URL)
+        # if not sitemap_content:
+            # logger.warning("Failed to fetch PWC sitemap content. Task exiting.")
+            # return
+# 
+        # logger.info("Parsing PWC sitemap content...")
+        # try:
+            # root = ET.fromstring(sitemap_content)
+            # paper_sitemaps = []
+            # for loc_element in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc'):
+                # if loc_element.text and 'sitemap-papers.xml' in loc_element.text:
+                    # paper_sitemaps.append(loc_element.text)
+# 
+            # for sub_sitemap_url in tqdm.tqdm(paper_sitemaps):
+                # sub_content = fetch_sitemap_content(sub_sitemap_url)
+                # parsed_urls, new_parsed_urls = [], []
+                # if not sub_content:
+                    # continue
+# 
+                # try:
+                    # sub_root = ET.fromstring(sub_content)
+                    # for loc_element in sub_root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc'):
+                        # if loc_element.text:
+                            # url = loc_element.text.strip()
+                            # parsed_url = urlparse(url)
+                            # if (parsed_url.netloc == PWC_DOMAIN and
+                                    # parsed_url.path.startswith(PWC_PAPER_PATH_PREFIX)):
+                                # parsed_urls.append(url)
+# 
+                        # if len(parsed_urls) == 500:
+                            # existing_urls = set(
+                                # CrawlTask.objects.filter(url__in=parsed_urls)
+                                            # .values_list('url', flat=True)
+                            # )
+                            # new_parsed_urls = list(set(parsed_urls) - existing_urls)
+                            # parsed_urls = []
+# 
+                    # for url in new_parsed_urls:
+                        # new_task = CrawlTask(url=url, status='pending')
+                        # new_task.save()
+                        # crawl_paper_details.delay(new_task.id)
+# 
+                # except ET.ParseError as e:
+                    # logger.error(f"Error parsing sub-sitemap {sub_sitemap_url}: {e}")
+                    # continue
+# 
+        # except ET.ParseError as e:
+            # logger.error(f"Error parsing main sitemap XML: {e}")
+            # return 0
+        # except Exception as e:
+            # logger.exception("An unexpected error occurred during sitemap parsing")
+            # return 0
+# 
+        # logger.info("PWC sitemap check task finished.")
+# 
+    # # --- Paper Crawling Task (PWC) --- #
+    # @shared_task(name='crawler.tasks.crawl_paper', bind=True, max_retries=3, default_retry_delay=60)
+    # def crawl_paper_details(self, task_id: int):
+        # """Celery task to crawl details for a single paper given a CrawlTask ID."""
+        # logger.info(f"Starting paper crawl for CrawlTask ID: {task_id}")
+# 
+        # try:
+            # task = CrawlTask.objects.get(pk=task_id)
+        # except CrawlTask.DoesNotExist:
+            # logger.error(f"CrawlTask with ID {task_id} not found. Task cannot proceed.")
+            # return
+        # except Exception as e:
+            # logger.exception(f"Error retrieving CrawlTask ID {task_id}. Retrying...")
+            # raise self.retry(exc=e)
+# 
+        # if task.status != 'pending':
+            # logger.warning(f"CrawlTask ID {task_id} is not in pending state (state={task.status}). Skipping crawl.")
+            # return
+# 
+        # # 1. Fetch HTML Content
+        # html_content = None
+        # try:
+            # response = requests.get(task.url, timeout=300)
+            # response.raise_for_status()
+            # html_content = response.text
+            # logger.info(f"Successfully fetched content from {task.url}")
+        # except requests.exceptions.RequestException as e:
+            # logger.error(f"HTTP error fetching {task.url} for Task ID {task_id}: {e}. Retrying...")
+            # raise self.retry(exc=e)
+        # except Exception as e:
+            # logger.exception(f"Unexpected error fetching {task.url} for Task ID {task_id}. Failing task.")
+            # task.status = 'failed'
+            # task.save(update_fields=['status', 'updated_at'])
+            # return
+# 
+        # # 2. Parse HTML Content
+        # parsed_data = None
+        # try:
+            # parsed_data = parse_paper_page_html(html_content, base_url=task.url)
+            # if not parsed_data:
+                # raise ValueError("Parser returned None or empty data.")
+            # logger.info(f"Successfully parsed content for Task ID {task_id}")
+        # except Exception as e:
+            # logger.exception(f"Error parsing HTML content for Task ID {task_id}. Failing task.")
+            # task.status = 'failed'
+            # task.save(update_fields=['status', 'updated_at'])
+            # return
+# 
+        # # 3. Create/Update Database Records (within a transaction)
+        # new_paper = None
+        # try:
+            # with transaction.atomic():
+                # author_objects = []
+                # for author_name in parsed_data.get('authors', []):
+                    # if not author_name or not isinstance(author_name, str):
+                        # logger.warning(f"Skipping invalid author name: {author_name}")
+                        # continue
+                    # try:
+                        # author, created = Author.objects.get_or_create(name=author_name.strip())
+                        # author_objects.append(author)
+                        # if created:
+                            # logger.info(f"Created new Author: {author_name}")
+                    # except Exception as author_ex:
+                        # logger.error(f"Error getting/creating author '{author_name}': {author_ex}")
+# 
+                # category_objects = []
+                # for category_name in parsed_data.get('categories', []):
+                    # if not category_name or not isinstance(category_name, str):
+                        # logger.warning(f"Skipping invalid category name: {category_name}")
+                        # continue
+                    # try:
+                        # category = Category.objects.filter(name=category_name.strip()).first()
+                        # if not category:
+                            # category = Category.objects.create(name=category_name.strip())
+                        # category_objects.append(category)
+                        # logger.info(f"Created new Category: {category_name}")
+                    # except Exception as cat_ex:
+                        # logger.error(f"Error getting/creating category '{category_name}': {cat_ex}")
+# 
+                # dataset_objects = []
+                # for dataset_info in parsed_data.get('datasets', []):
+                    # if not isinstance(dataset_info, dict) or 'name' not in dataset_info:
+                        # logger.warning(f"Skipping invalid dataset info: {dataset_info}")
+                        # continue
+                    # try:
+                        # dataset_id = crawl_dataset(
+                            # dataset_name=dataset_info['name'].strip(),
+                            # dataset_url=dataset_info.get('url', ''),
+                        # )
+                        # logger.info(f"Completed dataset crawling for {dataset_info['name']}")
+                        # dataset = Dataset.objects.get(id=dataset_id)
+                        # dataset_objects.append(dataset)
+                    # except Exception as ds_ex:
+                        # logger.error(f"Error processing dataset '{dataset_info}': {ds_ex}")
+# 
+                # paper_data = {
+                    # 'title': parsed_data.get('title', '[Title Not Found]'),
+                    # 'abstract': parsed_data.get('abstract', '[Abstract Not Found]'),
+                    # 'doi': parsed_data.get('doi'),
+                    # 'publication_date': parsed_data.get('publication_date'),
+                    # 'journal_or_conference': parsed_data.get('journal_or_conference', ''),
+                    # 'file_format': parsed_data.get('file_format', 'pdf'),
+                    # 'keywords': list(parsed_data.get('keywords', []) or []),
+                    # 'url': task.url,
+                    # 'pdf_url': parsed_data.get('pdf_url'),
+                    # 'github_url': parsed_data.get('github_url'),
+                    # 'download_count': parsed_data.get('download_count', 0),
+                    # 'views_count': parsed_data.get('views_count', 0),
+                    # 'citations_count': parsed_data.get('citations_count', 0)
+                # }
+                # paper_data = {k: v for k, v in paper_data.items() if v is not None}
+# 
+                # new_paper = Paper.objects.create(**paper_data)
+                # logger.info(f"Created Paper record ID {new_paper.id} for Task ID {task_id}")
+# 
+                # if author_objects:
+                    # new_paper.authors.set(author_objects)
+                # if category_objects:
+                    # new_paper.categories.set(category_objects)
+                # if dataset_objects:
+                    # new_paper.datasets.set(dataset_objects)
+# 
+                # if parsed_data.get('references'):
+                    # existing_papers = Paper.objects.filter(doi__in=parsed_data['references'])
+                    # if existing_papers.exists():
+                        # new_paper.references.set(existing_papers)
+# 
+                # task.paper = new_paper
+                # task.status = 'completed'
+                # task.updated_at = timezone.now()
+                # task.save(update_fields=['paper', 'status', 'updated_at'])
+                # logger.info(f"Successfully completed DB operations for CrawlTask ID: {task_id}")
+# 
+        # except Exception as e:
+            # logger.exception(f"Database error during record creation/update for Task ID {task_id}. Retrying...")
+            # raise self.retry(exc=e)
+# 
+        # if new_paper:
+            # map_paper_venue(new_paper.id)
+            # embed_paper(new_paper)
+# 
+        # logger.info(f"Paper crawl task finished for Task ID: {task_id}")
+# 
+    # # --- Dataset Crawling Task (PWC) --- #
+    # @shared_task(name='crawler.tasks.crawl_dataset', bind=True, max_retries=3, default_retry_delay=60)
+    # def crawl_dataset(self, dataset_name: str, dataset_url: str | None = None, paper_id: int | None = None):
+        # """Celery task to crawl dataset information and create/update dataset record."""
+        # logger.info(f"Starting dataset crawl for: {dataset_name}")
+# 
+        # try:
+            # dataset = Dataset.objects.filter(name=dataset_name).first()
+# 
+            # if dataset:
+                # logger.info(f"Found existing dataset: {dataset_name}")
+                # if paper_id:
+                    # paper = Paper.objects.get(id=paper_id)
+                    # dataset.papers.add(paper)
+                # return dataset.id
+# 
+            # if dataset_url:
+                # try:
+                    # response = requests.get(dataset_url, timeout=60)
+                    # response.raise_for_status()
+                    # dataset_data = parse_dataset_page(response.text, dataset_url)
+# 
+                    # if dataset_data:
+                        # dataset = Dataset.objects.create(
+                            # name=dataset_name,
+                            # description=dataset_data.get('description', ''),
+                            # crawled_url=dataset_data.get('crawled_url', ''),
+                            # url=dataset_data.get('url', ''),
+                            # modalities=dataset_data.get('modalities', ''),
+                            # languages=dataset_data.get('languages', ''),
+                            # licenses=dataset_data.get('licenses', ''),
+                            # tasks=dataset_data.get('tasks', '')
+                        # )
+                        # if paper_id:
+                            # paper = Paper.objects.get(id=paper_id)
+                            # dataset.papers.add(paper)
+                    # else:
+                        # dataset = Dataset.objects.create(name=dataset_name, crawled_url=dataset_url)
+                        # if paper_id:
+                            # paper = Paper.objects.get(id=paper_id)
+                            # dataset.papers.add(paper)
+                # except requests.RequestException as e:
+                    # logger.error(f"Error fetching dataset page for {dataset_name}: {e}")
+                    # dataset = Dataset.objects.create(name=dataset_name, crawled_url=dataset_url)
+                    # if paper_id:
+                        # paper = Paper.objects.get(id=paper_id)
+                        # dataset.papers.add(paper)
+            # else:
+                # dataset = Dataset.objects.create(name=dataset_name)
+                # if paper_id:
+                    # paper = Paper.objects.get(id=paper_id)
+                    # dataset.papers.add(paper)
+# 
+            # return dataset.id
+# 
+        # except Exception as e:
+            # logger.exception(f"Error processing dataset {dataset_name}: {e}")
+            # raise self.retry(exc=e)
 
 # --- PDF Download Helper --- #
 def download_pdf(pdf_url: str, paper_instance: Paper):
